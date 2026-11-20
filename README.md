@@ -1,8 +1,12 @@
+[![make.fun · gta6-trophy-rarity-forecast-01](https://make.fun/badge/gta6-trophy-rarity-forecast-01.svg)](https://make.fun/bounty/gta6-trophy-rarity-forecast-01?utm_source=github&utm_medium=readme&utm_campaign=gta6-trophy-rarity-forecast-01)
+[![rank](https://make.fun/badge/gta6-trophy-rarity-forecast-01/soundnesskhusus/gta6-trophy-rarity-forecast-01/rank.svg)](https://make.fun/bounty/gta6-trophy-rarity-forecast-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=gta6-trophy-rarity-forecast-01)
+[![reward](https://make.fun/badge/gta6-trophy-rarity-forecast-01/soundnesskhusus/gta6-trophy-rarity-forecast-01/reward.svg)](https://make.fun/bounty/gta6-trophy-rarity-forecast-01?utm_source=github&utm_medium=readme&utm_campaign=gta6-trophy-rarity-forecast-01)
+
 # GTA VI trophy rarity forecaster
 
 Forecasts every Grand Theft Auto VI (PS5) trophy's earn rate on Exophase
 at one week after launch, as five quantiles per trophy. Entry for the
-make.fun bounty `gta6-trophy-rarity-forecast-01`.
+[make.fun bounty `gta6-trophy-rarity-forecast-01`](https://make.fun/bounty/gta6-trophy-rarity-forecast-01).
 
 Run: `python3 main.py` (Python 3.13, standard library only, no network).
 It reads every `*.in` case in `$MAKEFUN_INPUT_DIR` (else `/input`) and
