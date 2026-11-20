@@ -1,668 +1,584 @@
-"""Forecast Grand Theft Auto VI (PS5) trophy earn rates at one week.
+"""GTA VI trophy rarity forecaster, round 2.
 
-Reads every case file found in the input directory (schema
-makefun/gta6-trophies-case/v1): a list of trophies plus the house's reads of
-Exophase's trophy page up to the case checkpoint. Writes one forecast file
-per case: for each trophy, five quantiles (5/25/50/75/95%) of its earn rate,
-in percent, at the case target.
+Forecasts every trophy's earn rate on Exophase at a case's target, from the
+reads in the case's own history. The forecast is built from an earners /
+players decomposition: the number of tracked players who have earned a trophy
+and the number of tracked players are modelled separately, then divided.
 
-Method, in brief: an earn rate is earners divided by players tracked, so the
-two are modelled separately. Players tracked follow a saturating growth
-curve. Each trophy's earners follow a saturating Weibull-style curve whose
-ceiling and timescale are fitted to the case history and shrunk toward a
-prior set by the trophy's archetype (story chapter, side mission, grind,
-easy activity, money, combat, flavour, platinum, 100% completion), which is
-inferred from the trophy's name, description and tier. The two curves are
-divided again at the target to give the median rate. When the whole history
-is one frozen page (the launch-night stale page), a refresh is overdue and
-the forecast instead applies a dilution drop. Spreads are honest logit-scale
-widths that grow with the horizon and with how uncertain a trophy is.
+Three extrapolators are combined per trophy (see forecast_trophy):
+  * a log-time line in logit space (rate against ln(1 + hours since release)),
+  * a recent exponential run on earners, damped by an archetype ceiling,
+  * a saturating growth curve on earners (added in a later step).
+Their weights come from rolling-origin backtests inside the case's history,
+so a variant that has actually predicted this game's recent reads gets more
+say than one that has not. Quantile spreads are calibrated from the same
+backtests, aiming for honest ~90% coverage instead of the over-wide bands
+that cost pinball loss at every trophy.
 
-Python 3.13, standard library only, no network, deterministic.
+A stale page (reads unchanged for hours) means Exophase has not refreshed
+its counts: the answer will be a refreshed page, so the forecast dilutes the
+rates by the players jump a refresh brings, while letting earners keep
+growing. The dilution size is read from the history's own past refresh
+jumps when there are any, else from the launch-night jump the rules
+describe (638 -> 3,868 players).
+
+Only the case file in the input directory is read; there is no network at
+grade time. Python 3.13 standard library only, fully deterministic.
 """
 
 import json
 import math
 import os
-import sys
 from datetime import datetime, timezone
+from pathlib import Path
 
-# Normal quantiles for the five levels 0.05, 0.25, 0.5, 0.75, 0.95.
-Z_VALUES = (-1.6448536269514722, -0.6744897501960817, 0.0,
-            0.6744897501960817, 1.6448536269514722)
+INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
+OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
 
-# Earn rates are scored on the logit scale after clamping to this range.
-LOGIT_LO = 0.01
-LOGIT_HI = 99.99
+LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
+Z = [-1.645, -0.674, 0, 0.674, 1.645]
 
-# Release moment: midnight UTC on the game's release date.
-RELEASE_ISO = "2026-11-19T00:00:00Z"
-
-
-def parse_moment(text):
-    """Parse an ISO 8601 UTC timestamp into an aware datetime."""
-    if text.endswith("Z"):
-        text = text[:-1] + "+00:00"
-    moment = datetime.fromisoformat(text)
-    if moment.tzinfo is None:
-        moment = moment.replace(tzinfo=timezone.utc)
-    return moment
+# Release of the game, the origin of every "hours since release" clock.
+RELEASE = datetime(2026, 11, 19, 0, 0, 0, tzinfo=timezone.utc)
+# The players jump of the launch-night refresh the rules describe (638 -> 3868),
+# used as the dilution prior only when the history shows no refresh of its own.
+LAUNCH_DILUTION = 3868.0 / 638.0
 
 
-def hours_since_release(moment):
-    """Hours from the release moment to the given moment (may be negative)."""
-    origin = parse_moment(RELEASE_ISO)
-    return (moment - origin).total_seconds() / 3600.0
+def clamp_pct(x):
+    return min(99.99, max(0.01, x))
 
 
-def clamp_rate(rate):
-    """Clamp a percent into the range the scorer's logit can take."""
-    if rate < LOGIT_LO:
-        return LOGIT_LO
-    if rate > LOGIT_HI:
-        return LOGIT_HI
-    return rate
-
-
-def logit_of(rate):
-    """logit of a percent: ln(p / (1 - p)) with p = rate / 100."""
-    p = clamp_rate(rate) / 100.0
+def logit_pct(x):
+    p = clamp_pct(x) / 100.0
     return math.log(p / (1.0 - p))
 
 
-def rate_from_logit(value):
-    """Inverse logit back to a percent, clamped to the open interval."""
-    if value > 30.0:
-        return LOGIT_HI
-    if value < -30.0:
-        return LOGIT_LO
-    p = 1.0 / (1.0 + math.exp(-value))
-    out = 100.0 * p
-    if out < LOGIT_LO:
-        return LOGIT_LO
-    if out > LOGIT_HI:
-        return LOGIT_HI
-    return out
+def inv_logit_pct(y):
+    if y >= 0:
+        return 100.0 / (1.0 + math.exp(-y))
+    e = math.exp(y)
+    return 100.0 * e / (1.0 + e)
 
 
-def round4(value):
-    """Round to 4 decimals, keeping the value a plain float."""
-    return round(float(value) + 0.0, 4)
+def round4(x):
+    """Round to 4 decimals, halves away from zero (the kit's convention)."""
+    scaled = x * 10000.0
+    whole = math.floor(scaled + 0.5) if scaled >= 0 else math.ceil(scaled - 0.5)
+    value = whole / 10000.0
+    return int(value) if float(value).is_integer() else value
 
 
-def fit_straight_line(xs, ys):
-    """Least-squares y = a + b*x; returns (a, b) or None when degenerate."""
-    n = len(xs)
-    if n < 2:
-        return None
-    mean_x = sum(xs) / n
-    mean_y = sum(ys) / n
-    sxx = 0.0
-    sxy = 0.0
-    for x, y in zip(xs, ys):
-        dx = x - mean_x
-        sxx += dx * dx
-        sxy += dx * (y - mean_y)
-    if sxx <= 1e-12:
-        return None
-    slope = sxy / sxx
-    return (mean_y - slope * mean_x, slope)
+def parse_time(text):
+    return datetime.fromisoformat(text.replace("Z", "+00:00"))
 
 
-def input_folder():
-    """Input directory: $MAKEFUN_INPUT_DIR when set, else /input."""
-    chosen = os.environ.get("MAKEFUN_INPUT_DIR")
-    if chosen:
-        return chosen
-    return "/input"
+def hours_since_release(moment):
+    return (moment - RELEASE).total_seconds() / 3600.0
 
-
-def output_folder():
-    """Output directory: $MAKEFUN_OUTPUT_DIR when set, else /output."""
-    chosen = os.environ.get("MAKEFUN_OUTPUT_DIR")
-    if chosen:
-        return chosen
-    return "/output"
-
-
-def list_case_paths(folder):
-    """Every *.in file in the folder, in name order."""
-    names = []
-    try:
-        entries = os.listdir(folder)
-    except OSError:
-        return names
-    for name in entries:
-        if name.endswith(".in"):
-            names.append(os.path.join(folder, name))
-    names.sort()
-    return names
-
-
-def load_case(path):
-    """Load one case file as a dict."""
-    with open(path, "r", encoding="utf-8") as handle:
-        return json.load(handle)
-
-
-def write_forecast(folder, case_id, rows):
-    """Write {"trophies": [...]} for one case, creating the folder."""
-    os.makedirs(folder, exist_ok=True)
-    payload = {"trophies": rows}
-    target = os.path.join(folder, case_id + ".out")
-    with open(target, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, separators=(",", ":"))
-        handle.write("\n")
 
 # ---------------------------------------------------------------------------
-# Trophy archetypes and their priors.
-#
-# A trophy's earners rise on a saturating curve. How high that curve can go
-# (its ceiling, as a share of tracked players) and how fast it gets there
-# depends on what the trophy asks for. The table below is calibrated from
-# the live Exophase page two days after launch (Chapter 1 already near 8%,
-# the fishing challenge above 10%, late chapters near zero) and from how
-# Grand Theft Auto V's trophies spread out over a long lifetime (first
-# mission common, final mission and 100% completion very rare). Each row is
-# (ceiling share, timescale in hours, Weibull shape, extra logit spread,
-# stale-window earner growth, fresh-player earn chance). The fit to the
-# case history dominates whenever the history is informative; the prior only
-# steadies trophies whose history barely moves.
+# Archetypes: what kind of trophy this is, from the case's own metadata.
+# The archetype sets the priors a thin history cannot: how high a rate can
+# eventually go, how fast earners arrive, and how wide the bands should be.
 # ---------------------------------------------------------------------------
 
-ARCHETYPE_PRIORS = {
-    "opening":       (1.00,  12.0, 2.0, 0.05, 0.0, 1.00),
-    "chapter1":      (0.85, 110.0, 2.0, 0.10, 0.075, 0.00025),
-    "chapter2":      (0.65, 170.0, 2.0, 0.15, 0.05, 0.000075),
-    "chapter3":      (0.50, 260.0, 2.0, 0.20, 0.0375, 0.00005),
-    "chapter4":      (0.40, 330.0, 2.0, 0.25, 0.025, 0.000025),
-    "finale":        (0.28, 420.0, 2.0, 0.30, 0.0125, 0.000025),
-    "story_mission": (0.45, 220.0, 2.0, 0.20, 0.075, 0.0002),
-    "side_mission":  (0.25, 350.0, 2.0, 0.30, 0.0375, 0.00005),
-    "platinum":      (0.04, 1500.0, 2.0, 0.55, 0.0, 0.0),
-    "completion":    (0.04, 1300.0, 2.0, 0.55, 0.0, 0.0),
-    "grind_big":     (0.05, 700.0, 1.5, 0.40, 0.025, 0.00005),
-    "grind_mid":     (0.12, 500.0, 1.5, 0.30, 0.075, 0.0005),
-    "easy":          (0.35, 150.0, 1.5, 0.15, 0.125, 0.0005),
-    "money":         (0.08, 450.0, 1.5, 0.35, 0.05, 0.000125),
-    "combat":        (0.18, 320.0, 1.8, 0.25, 0.075, 0.00025),
-    "flavour":       (0.20, 280.0, 1.8, 0.30, 0.075, 0.00025),
+def archetype(trophy, last_rate):
+    if trophy["tier"] == "platinum":
+        return "platinum"
+    if last_rate is not None and last_rate >= 99.99:
+        return "universal"
+    text = (trophy["name"] + " " + trophy["description"]).lower()
+    if "chapter" in text or "final mission" in text or trophy["tier"] == "gold":
+        return "story"
+    if any(k in text for k in ("stunt", "challenge", "collectible", "vehicle",
+                               "completion", "100%")):
+        return "grind"
+    return "activity"
+
+
+# Eventual ceiling: the share of tracked players who could ever earn a trophy
+# of this kind (fraction, not percent). Story ceilings fall with depth: the
+# first chapter is finished by most players, later ones by fewer.
+ARCH_CEILING = {
+    "story": 0.80,
+    "activity": 0.35,
+    "grind": 0.10,
+    "platinum": 0.02,
+    "universal": 1.0,
+}
+# A floor rate (percent) for a trophy nobody has earned yet: someone will
+# have earned it by the target, and 0.00% would score badly if they have.
+ARCH_FLOOR_PCT = {
+    "story": 0.05,
+    "activity": 0.02,
+    "grind": 0.01,
+    "platinum": 0.005,
+    "universal": 100.0,
+}
+# Saturating-growth shape the earners curve starts from when the data is
+# thin: (tau hours, shape k). Story tau grows with depth into the story.
+ARCH_WEIBULL = {
+    "story": (72.0, 1.5),
+    "activity": (36.0, 1.2),
+    "grind": (240.0, 1.0),
+    "platinum": (720.0, 1.3),
+    "universal": (24.0, 1.0),
 }
 
 
-def classify_trophy(trophy):
-    """Guess a trophy's archetype from its tier, name and description."""
-    tier = (trophy.get("tier") or "").lower()
-    text = ((trophy.get("description") or "") + " " +
-            (trophy.get("name") or "")).strip()
-    low = text.lower()
-    if tier == "platinum":
-        return "platinum"
-    if "100% completion" in low:
-        return "completion"
-    if low.startswith("complete chapter 1."):
-        return "chapter1"
-    if low.startswith("complete chapter 2."):
-        return "chapter2"
-    if low.startswith("complete chapter 3."):
-        return "chapter3"
-    if low.startswith("complete chapter 4."):
-        return "chapter4"
-    if low.startswith("complete the final mission."):
-        return "finale"
-    if low.startswith("complete gone fishing."):
-        return "opening"
-    if low.startswith("complete the final mission for"):
-        return "side_mission"
-    if low.startswith("complete ") and trophy.get("secret"):
-        return "story_mission"
-    if ("stunts" in low or "challenges" in low or "waink" in low
-            or "card sets" in low or "mission strands" in low
-            or "shooting range" in low or "drone race" in low
-            or "meditate at every spot" in low):
-        return "grind_big"
-    if ("discover 100 vehicles" in low or "win 20 different races" in low
-            or "explore all of leonida" in low):
-        return "grind_mid"
-    if ("fishing challenge" in low or "arcade game" in low
-            or "try each type of activity" in low):
-        return "easy"
-    if ("laundering" in low or "spend $100,000" in low
-            or "garage properties" in low or "register 10 vehicles" in low):
-        return "money"
-    if ("combat focus" in low or "jewelry store" in low
-            or "bank vaults" in low or "armored truck" in low
-            or "illegal operation" in low or "rob 3 shops" in low
-            or "wanted level" in low or "vcia" in low or "rhinos" in low):
-        return "combat"
-    return "flavour"
+def story_depth(trophies, idx):
+    """How deep into the story this trophy sits (0 = earliest story trophy)."""
+    depth = 0
+    for j, t in enumerate(trophies):
+        if j == idx:
+            return depth
+        if archetype(t, None) == "story":
+            depth += 1
+    return depth
 
 
-def prior_for(trophy):
-    """The prior row for a trophy: (ceiling, tau, shape, spread, stale, fresh)."""
-    return ARCHETYPE_PRIORS[classify_trophy(trophy)]
+def ceiling_for(trophies, idx, kind):
+    if kind == "story":
+        return ARCH_CEILING["story"] * (0.85 ** story_depth(trophies, idx))
+    return ARCH_CEILING[kind]
 
-def distinct_snapshots(case):
-    """Compress the history to reads where something actually changed.
 
-    Exophase refreshes discretely, so long runs of reads repeat the same
-    page. Keeping every repeat would overweight the stale stretch in every
-    fit, so only the first read of each distinct page is kept. Returns a
-    list of (hours since release, players tracked, rates list).
+# ---------------------------------------------------------------------------
+# History, unpacked once per case.
+# ---------------------------------------------------------------------------
+
+class History:
+    def __init__(self, case):
+        self.times = []      # hours since release, per read
+        self.players = []    # players tracked, per read
+        self.rates = []      # rates[i][j]: trophy i, read j (None where missing)
+        self.earned = []     # earners[i][j] = rates * players / 100
+        n = len(case["trophies"])
+        self.rates = [[] for _ in range(n)]
+        self.earned = [[] for _ in range(n)]
+        for read in case["history"]:
+            moment = parse_time(read["at"])
+            self.times.append(hours_since_release(moment))
+            p = float(read["players_tracked"])
+            self.players.append(p)
+            for i in range(n):
+                r = read["rates"][i]
+                self.rates[i].append(r)
+                self.earned[i].append(None if r is None else r * p / 100.0)
+        self.n_reads = len(self.times)
+        self.last_players = self.players[-1] if self.players else 0.0
+        self.last_rates = [self.rates[i][-1] if self.rates[i] else None
+                           for i in range(n)]
+
+    def recent(self, hours, upto=None):
+        """Indices of reads in the last `hours` before read `upto` (default: last)."""
+        end = self.n_reads - 1 if upto is None else upto
+        t_end = self.times[end]
+        return [j for j in range(end + 1) if t_end - self.times[j] <= hours + 1e-9]
+
+
+def fit_line(xs, ys):
+    """Least squares y = a + b*x. Returns (a, b) or None when degenerate."""
+    n = len(xs)
+    if n < 2:
+        return None
+    mx = sum(xs) / n
+    my = sum(ys) / n
+    sxx = sum((x - mx) ** 2 for x in xs)
+    if sxx <= 1e-12:
+        return None
+    sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    b = sxy / sxx
+    return my - b * mx, b
+
+
+def players_forecast(hist, h_target):
+    """Tracked players at the target hour, from a log-time fit.
+
+    log P is fitted against ln(1 + hours since release) over the last 48h of
+    reads: early on, players arrive roughly like a power of time. Returns
+    (players, log_growth_per_day) for the spread model.
     """
-    seen = []
-    previous = None
-    for read in case.get("history") or []:
-        players = read.get("players_tracked")
-        rates = read.get("rates") or []
-        key = (players, tuple(rates))
-        if key == previous:
-            continue
-        previous = key
-        try:
-            moment = parse_moment(read.get("at") or read.get("slot"))
-        except (ValueError, TypeError):
-            continue
-        seen.append((hours_since_release(moment), players, list(rates)))
-    return seen
+    idx = hist.recent(48.0)
+    if len(idx) < 2:
+        idx = list(range(hist.n_reads))
+    xs = [math.log1p(hist.times[j]) for j in idx]
+    ys = [math.log(max(1.0, hist.players[j])) for j in idx]
+    fit = fit_line(xs, ys)
+    if fit is None:
+        return hist.last_players, 0.0
+    a, b = fit
+    log_p = a + b * math.log1p(h_target)
+    # The same fit's implied daily log growth at the target hour.
+    daily = b * (24.0 / (1.0 + h_target))
+    return max(hist.last_players, math.exp(log_p)), daily
 
 
-def weibull_rise(t, tau, shape):
-    """Saturating rise 1 - exp(-(t / tau) ** shape), t in hours."""
-    if t <= 0.0:
-        return 0.0
-    scaled = t / tau
-    if scaled > 12.0:
-        return 1.0
-    return 1.0 - math.exp(-(scaled ** shape))
+def variant_logtime(hist, i, h_target, upto=None):
+    """Logit rate linear in ln(1 + hours), fitted on the last 24h of reads.
 
-
-def _log_grid(lo, hi, count):
-    """`count` points spaced evenly in log space from lo to hi."""
-    start = math.log(lo)
-    step = (math.log(hi) - start) / max(count - 1, 1)
-    return [math.exp(start + step * i) for i in range(count)]
-
-
-def fit_players(snapshots, target_u):
-    """Fit players tracked as a saturating curve and extrapolate.
-
-    P(u) = P_inf * (1 - exp(-u / tau)), u measured in hours since the
-    first read, fitted on log P over a grid of tau. Returns
-    (P at target, P_inf, tau, log-residual sd, number of points) or None
-    when the history carries no usable growth signal.
+    Returns a median rate percent, or None when the trophy has no usable
+    positive rate in the window.
     """
-    if len(snapshots) < 2:
+    end = hist.n_reads - 1 if upto is None else upto
+    idx = [j for j in hist.recent(24.0, upto=end)
+           if hist.rates[i][j] is not None and 0.0 < hist.rates[i][j] < 100.0]
+    if len(idx) < 3:
+        idx = [j for j in range(end + 1)
+               if hist.rates[i][j] is not None and 0.0 < hist.rates[i][j] < 100.0]
+    if len(idx) < 2:
         return None
-    base = snapshots[0][0]
-    us = []
-    logs = []
-    for t, players, _rates in snapshots:
-        if players and players > 0:
-            us.append(max(t - base, 0.0))
-            logs.append(math.log(players))
-    if len(us) < 2 or max(us) <= 0.0:
-        return None
-    best = None
-    for tau in _log_grid(6.0, 3000.0, 41):
-        shifted = []
-        usable = True
-        for u, lp in zip(us, logs):
-            rise = 1.0 - math.exp(-u / tau) if u > 0 else 0.0
-            if rise <= 1e-6:
-                continue
-            shifted.append(lp - math.log(rise))
-        if len(shifted) < 2:
-            continue
-        log_inf = sum(shifted) / len(shifted)
-        sse = 0.0
-        used = 0
-        for u, lp in zip(us, logs):
-            rise = 1.0 - math.exp(-u / tau) if u > 0 else 0.0
-            if rise <= 1e-6:
-                continue
-            diff = lp - (log_inf + math.log(rise))
-            sse += diff * diff
-            used += 1
-        if used < 2:
-            continue
-        score = sse / used
-        if best is None or score < best[0]:
-            best = (score, log_inf, tau, used)
-    if best is None:
-        return None
-    score, log_inf, tau, used = best
-    p_inf = math.exp(log_inf)
-    u_target = max(target_u - base, 0.0)
-    p_target = p_inf * (1.0 - math.exp(-u_target / tau)) if u_target > 0 else p_inf
-    resid = math.sqrt(score) if score > 0 else 0.0
-    return (p_target, p_inf, tau, resid, used)
-
-
-def fit_earners_grid(times, earners):
-    """Grid of Weibull fits for one trophy's earners.
-
-    E(t) = A * (1 - exp(-(t / tau) ** k)), fitted on log(E + 0.5) over a
-    grid of tau and k, with A by least squares for each pair. Returns a
-    list of (tau, shape, log A, sse, used). The caller averages over this
-    grid with a prior, because on early data A and tau are barely
-    separable: many pairs fit the history equally well and only the prior
-    tells them apart at the target.
-    """
-    points = []
-    for t, e in zip(times, earners):
-        if e is None:
-            continue
-        points.append((max(t, 0.25), max(e, 0.0)))
-    if len(points) < 2:
-        return []
-    xs = [p[0] for p in points]
-    ys = [math.log(p[1] + 0.5) for p in points]
-    grid = []
-    for tau in _log_grid(12.0, 2500.0, 33):
-        for shape in (1.0, 1.5, 2.0, 2.5, 3.0):
-            rises = [weibull_rise(x, tau, shape) for x in xs]
-            terms = []
-            for rise, y in zip(rises, ys):
-                if rise <= 0.01:
-                    continue
-                terms.append(y - math.log(rise))
-            if len(terms) < 2:
-                continue
-            log_a = sum(terms) / len(terms)
-            sse = 0.0
-            for rise, y in zip(rises, ys):
-                if rise <= 0.01:
-                    continue
-                diff = y - (log_a + math.log(rise))
-                sse += diff * diff
-            grid.append((tau, shape, log_a, sse, len(terms)))
-    return grid
-
-
-def average_earners(grid, target_t, a_prior, tau_prior, p_inf, ceiling):
-    """Posterior mean of earners at the target over the Weibull grid.
-
-    Weights are likelihood times prior: the likelihood from the fit's
-    squared log error with a noise floor (the curve family never matches
-    reality exactly, so a near-perfect in-sample fit must not collapse
-    the average onto one point), the prior lognormal around the
-    archetype's timescale and ceiling. Returns (mean earners, relative
-    sd of earners) or None when the grid is empty.
-    """
-    if not grid:
-        return None
-    best_sse = min(g[3] for g in grid)
-    best_used = max(g[4] for g in grid)
-    var = best_sse / max(best_used, 1)
-    if var < 0.04:
-        var = 0.04
-    log_tau_prior = math.log(tau_prior)
-    log_a_prior = math.log(a_prior)
-    cap = ceiling * p_inf * 1.5
-    total = 0.0
-    mean = 0.0
-    sq = 0.0
-    for tau_g, k_g, log_a_g, sse_g, _used in grid:
-        a_g = math.exp(log_a_g)
-        if a_g > cap:
-            a_g = cap
-            log_a_g = math.log(a_g)
-        like = math.exp(-(sse_g - best_sse) / (2.0 * var))
-        prior_tau = math.exp(-0.5 * ((math.log(tau_g) - log_tau_prior) / 0.7) ** 2)
-        prior_a = math.exp(-0.5 * ((log_a_g - log_a_prior) / 0.7) ** 2)
-        weight = like * prior_tau * prior_a
-        e_g = a_g * weibull_rise(target_t, tau_g, k_g)
-        total += weight
-        mean += weight * e_g
-        sq += weight * e_g * e_g
-    if total <= 0.0:
-        return None
-    mean /= total
-    var_e = sq / total - mean * mean
-    if var_e < 0.0:
-        var_e = 0.0
-    rel = math.sqrt(var_e) / mean if mean > 0 else 1.0
-    return (mean, rel)
-
-
-def trend_median(times, rates, target_t):
-    """House-trend-style median: logit(rate) linear in ln(1 + hours).
-
-    Uses the last 24 hours of reads. Returns (median rate, residual sd)
-    or None when fewer than 3 usable reads exist.
-    """
-    if not times:
-        return None
-    latest = max(times)
-    xs = []
-    ys = []
-    for t, r in zip(times, rates):
-        if r is None or t < latest - 24.0:
-            continue
-        xs.append(math.log1p(max(t, 0.0)))
-        ys.append(logit_of(r))
-    if len(xs) < 3:
-        return None
-    fit = fit_straight_line(xs, ys)
+    xs = [math.log1p(hist.times[j]) for j in idx]
+    ys = [logit_pct(hist.rates[i][j]) for j in idx]
+    fit = fit_line(xs, ys)
     if fit is None:
         return None
-    intercept, slope = fit
-    if slope < 0.0:
-        slope = 0.0
-    resid = 0.0
-    for x, y in zip(xs, ys):
-        diff = y - (intercept + slope * x)
-        resid += diff * diff
-    resid = math.sqrt(resid / len(xs))
-    median = rate_from_logit(intercept + slope * math.log1p(max(target_t, 0.0)))
-    return (median, resid)
-
-def _quantiles_from(median, spread):
-    """Five quantiles around a median rate on the logit scale."""
-    if median >= 100.0:
-        return [100.0, 100.0, 100.0, 100.0, 100.0]
-    centre = logit_of(median)
-    out = []
-    for z in Z_VALUES:
-        value = rate_from_logit(centre + z * spread)
-        out.append(round4(value))
-    for i in range(1, len(out)):
-        if out[i] < out[i - 1]:
-            out[i] = out[i - 1]
-    return out
+    a, b = fit
+    return clamp_pct(inv_logit_pct(a + b * math.log1p(h_target)))
 
 
-def _stale_median(trophy, last_rate, last_players):
-    """Forecast when the history is one frozen page (launch night).
+def variant_recent_exp(hist, i, h_target, p_target, ceiling, upto=None):
+    """Recent exponential run on earners, damped by the archetype ceiling.
 
-    Exophase has not refreshed for hours, so the next refresh jumps the
-    tracked players (about sixfold on launch night, 638 to 3,868) while
-    earners only grew a little. The rate therefore drops for every trophy
-    but the opening one. Newly tracked players add a few earners, at a
-    rate set by the trophy's archetype.
+    ln(earners) is fitted against clock hours over the last 12h, then the
+    raw extrapolation is pulled back towards the ceiling with a soft cap, so
+    a hot streak cannot forecast more earners than the player base can hold.
+    Returns a median rate percent, or None when earners are all zero.
     """
-    prior = prior_for(trophy)
-    _ceiling, _tau, _shape, _spread, stale_growth, fresh_prob = prior
-    if last_rate is None:
-        last_rate = 0.0
-    if last_rate >= 100.0:
-        return 100.0
-    players_new = last_players * 6.0
-    earners_old = last_rate * last_players / 100.0
-    earners_new = (earners_old * (1.0 + stale_growth)
-                   + (players_new - last_players) * fresh_prob)
-    rate = 100.0 * earners_new / players_new if players_new > 0 else last_rate
-    if rate < 0.01:
-        rate = 0.01
-    if rate > 99.99:
-        rate = 99.99
-    return rate
+    end = hist.n_reads - 1 if upto is None else upto
+    idx = [j for j in hist.recent(12.0, upto=end)
+           if hist.earned[i][j] is not None and hist.earned[i][j] > 0]
+    if len(idx) < 3:
+        idx = [j for j in range(end + 1)
+               if hist.earned[i][j] is not None and hist.earned[i][j] > 0]
+    if len(idx) < 2:
+        return None
+    xs = [hist.times[j] for j in idx]
+    ys = [math.log(hist.earned[i][j]) for j in idx]
+    fit = fit_line(xs, ys)
+    if fit is None:
+        return None
+    a, g = fit
+    raw = math.exp(a + g * h_target)
+    cap_earners = max(1.0, p_target * ceiling)
+    damped = raw / (1.0 + raw / cap_earners)
+    return clamp_pct(100.0 * damped / max(1.0, p_target))
 
 
-def _forecast_one(trophy, series, target_t, horizon_days, players_fit):
-    """Forecast one trophy: returns (median rate, logit spread)."""
-    prior = prior_for(trophy)
-    ceiling, tau_prior, k_prior, spread_extra = prior[0], prior[1], prior[2], prior[3]
-    times = [point[0] for point in series]
-    rates = [point[1] for point in series]
-    last_rate = rates[-1] if rates else None
-    if last_rate is not None and last_rate >= 100.0:
-        return (100.0, 0.05)
-    if not series:
-        return (max(0.05, 100.0 * ceiling * 0.02), 1.2 + spread_extra)
+WEIBULL_TAUS = (8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0)
+WEIBULL_KS = (0.8, 1.2, 1.8, 2.6)
 
-    players_target = None
-    if players_fit is not None:
-        players_target = players_fit[0]
-    if players_target is None or players_target <= 0:
-        players_target = series[-1][2] if series else 1.0
 
-    earners = []
-    for _t, r, players in series:
-        if r is None or players is None or players <= 0:
-            earners.append(None)
+def variant_weibull(hist, i, h_target, p_target, tau0, k0, ceiling=1.0, upto=None):
+    """Saturating growth on earners: E(h) = S * (1 - exp(-(h/tau)^k)).
+
+    The shape (tau, k) is chosen from a grid. S is solved in closed form
+    for each shape and the shape is picked by a variance-stabilised error,
+    so the fit is stable on counts that run from zero to thousands. The
+    grid stops at timescales the history can still speak about: with two
+    days of reads, a still-growing trophy and a saturating one look alike,
+    and a shape that runs away to a power law would only invent growth.
+    When earners have been flat, the shape is unidentified and the forecast
+    stays flat instead of inventing growth from the clock alone. Two days
+    of history also cannot tell a still-growing trophy from a saturating
+    one: many shapes fit almost equally well while extrapolating very
+    differently. Among shapes within 10% of the best fit, the forecast
+    takes the median extrapolation, not the most extreme: in launch week
+    growth continuing is common, but the fastest-growing shape is usually
+    an artefact of the grid's edge. The rate is also capped at the
+    archetype ceiling: no trophy can pass the share of players who could
+    ever earn it. Returns a median rate percent, or None when the trophy
+    has no earners at all in the window.
+    """
+    end = hist.n_reads - 1 if upto is None else upto
+    idx = [j for j in range(end + 1) if hist.earned[i][j] is not None]
+    if not idx or all(hist.earned[i][j] == 0 for j in idx):
+        return None
+    hs = [hist.times[j] for j in idx]
+    es = [hist.earned[i][j] for j in idx]
+    e_mean = sum(es) / len(es)
+    if max(es) - min(es) <= 0.05 * (1.0 + e_mean):
+        return clamp_pct(100.0 * es[-1] / max(1.0, p_target))
+    scored = []
+    for tau in WEIBULL_TAUS:
+        for k in WEIBULL_KS:
+            w = [1.0 - math.exp(-((h / tau) ** k)) if h > 0 else 0.0 for h in hs]
+            sw2 = sum(v * v for v in w)
+            if sw2 <= 1e-12:
+                continue
+            s = sum(e * v for e, v in zip(es, w)) / sw2
+            if s <= 0:
+                continue
+            sse = sum((e - s * v) ** 2 / (1.0 + e) for e, v in zip(es, w))
+            e_t = s * (1.0 - math.exp(-((h_target / tau) ** k))) if h_target > 0 else 0.0
+            scored.append((sse, e_t))
+    if not scored:
+        return None
+    best_sse = min(s for s, _ in scored)
+    # Tie-break: two days of history cannot tell a still-growing trophy
+    # from a saturating one -- many shapes fit almost equally well while
+    # extrapolating very differently. Among shapes within 10% of the best
+    # fit, take the median extrapolation: the most extreme shape is
+    # usually an artefact of the grid's edge, and the median hedges the
+    # saturating and the still-growing readings of the same data.
+    near = sorted(e_t for s, e_t in scored if s <= 1.10 * best_sse)
+    e_target = near[len(near) // 2]
+    rate = 100.0 * e_target / max(1.0, p_target)
+    return clamp_pct(min(rate, 100.0 * ceiling))
+
+
+def backtest_weights(hist, trophies, p_target_now):
+    """Rolling-origin weights for the three variants, from the case itself.
+
+    Pseudo-checkpoints are cut inside the history; each variant forecasts
+    the rates at reads 6h, 24h and 36h later using only reads up to the cut,
+    and is scored by its median's mean absolute logit error against the
+    actual rates. The longest horizon carries half the weight: a 6h
+    backtest cannot tell the variants apart, and it is the long horizon
+    that decides the final -- a variant that fits the local acceleration
+    can still overshoot badly four days out. Weights are a softmax over those errors, with
+    a small uniform floor so no variant is ever fully excluded -- the
+    hedge matters when the regime turns. Also returns, per archetype, the
+    mean absolute logit error of the weight-blended median at the backtest
+    horizons, which calibrates the final quantile bands.
+    Returns (weights dict, resid_blend dict archetype -> mean |err|).
+    """
+    n = hist.n_reads
+    if n < 8:
+        return {"logtime": 1.0 / 3, "recent": 1.0 / 3, "weibull": 1.0 / 3}, {}
+    span = hist.times[-1] - hist.times[0]
+    if span < 12.0:
+        return {"logtime": 1.0 / 3, "recent": 1.0 / 3, "weibull": 1.0 / 3}, {}
+    cuts = sorted(set([int(n * 0.2), int(n * 0.4), int(n * 0.6)]))
+    cuts = [c for c in cuts if 0 <= c < n - 1]
+    horizons = [(6.0, 0.15), (24.0, 0.35), (36.0, 0.50)]
+    errs = {"logtime": [], "recent": [], "weibull": []}
+    points = []  # (archetype, actual rate, {variant: median}) for blend residuals
+    for c in cuts:
+        for horizon_h, _w in horizons:
+            pt = None
+            for j in range(c + 1, n):
+                if hist.times[j] - hist.times[c] >= horizon_h - 1e-9:
+                    pt = j
+                    break
+            if pt is None:
+                continue
+            h_pt = hist.times[pt]
+            p_pt = hist.players[pt]
+            for i, trophy in enumerate(trophies):
+                actual = hist.rates[i][pt]
+                if actual is None or actual <= 0.0 or actual >= 100.0:
+                    continue
+                kind = archetype(trophy, hist.rates[i][c])
+                if kind == "universal":
+                    continue
+                ceiling = ceiling_for(trophies, i, kind)
+                tau0, k0 = ARCH_WEIBULL[kind]
+                if kind == "story":
+                    tau0 = 24.0 + 18.0 * story_depth(trophies, i)
+                preds = {}
+                v = variant_logtime(hist, i, h_pt, upto=c)
+                if v is not None:
+                    preds["logtime"] = v
+                v = variant_recent_exp(hist, i, h_pt, p_pt, ceiling, upto=c)
+                if v is not None:
+                    preds["recent"] = v
+                v = variant_weibull(hist, i, h_pt, p_pt, tau0, k0, ceiling, upto=c)
+                if v is not None:
+                    preds["weibull"] = v
+                if not preds:
+                    continue
+                for name, med in preds.items():
+                    e = abs(logit_pct(actual) - logit_pct(med))
+                    errs[name].append((e, _w))
+                points.append((kind, actual, dict(preds)))
+    def wmean(pairs):
+        tot = sum(w for _, w in pairs)
+        return sum(e * w for e, w in pairs) / tot if tot > 0 else None
+    means = {k: wmean(v) for k, v in errs.items()}
+    present = {k: v for k, v in means.items() if v is not None}
+    if not present:
+        return {"logtime": 1.0 / 3, "recent": 1.0 / 3, "weibull": 1.0 / 3}, {}
+    if max(present.values()) - min(present.values()) < 1e-9:
+        weights = {k: 1.0 / 3 for k in ("logtime", "recent", "weibull")}
+    else:
+        raw = {k: math.exp(-v / 0.08) for k, v in present.items()}
+        tot = sum(raw.values())
+        weights = {}
+        for k in ("logtime", "recent", "weibull"):
+            soft = raw.get(k, 0.0) / tot if tot > 0 else 0.0
+            weights[k] = 0.75 * soft + 0.25 / 3.0
+        tot2 = sum(weights.values())
+        weights = {k: v / tot2 for k, v in weights.items()}
+    resid_blend = {}
+    if points:
+        by_kind = {}
+        for kind, actual, preds in points:
+            wsum = sum(weights[k] for k in preds)
+            blend = sum(weights[k] * logit_pct(p) for k, p in preds.items()) / wsum
+            by_kind.setdefault(kind, []).append(abs(logit_pct(actual) - blend))
+        for kind, xs in by_kind.items():
+            if len(xs) >= 5:
+                resid_blend[kind] = sum(xs) / len(xs)
+    return weights, resid_blend
+
+
+def staleness(hist):
+    """Is the page stale -- reads unchanged for hours -- and by how much
+    would a refresh dilute the rates?
+
+    Exophase refreshes a game's counts on its own schedule, hours apart,
+    not continuously: a long run of identical reads means the page is
+    showing old counts and the answer will be a refreshed page. The
+    dilution factor is the median players jump the history itself has
+    seen at a refresh, or the launch-night jump the rules describe when
+    the history shows none. Returns (stale_hours, dilution, run_start_hour)
+    or None.
+    """
+    n = hist.n_reads
+    if n < 2:
+        return None
+    run_start = n - 1
+    while run_start > 0:
+        j = run_start - 1
+        same_players = hist.players[j] == hist.players[run_start]
+        same_rates = all(hist.rates[i][j] == hist.rates[i][run_start]
+                         for i in range(len(hist.rates)))
+        if same_players and same_rates:
+            run_start = j
         else:
-            earners.append(r * players / 100.0)
-    grid = fit_earners_grid(times, earners)
-    median_ep = None
-    resid = 0.0
-    if grid:
-        p_inf = players_fit[1] if players_fit is not None else players_target
-        if p_inf <= 0:
-            p_inf = players_target
-        a_prior = ceiling * p_inf
-        if a_prior <= 0:
-            a_prior = 0.5
-        averaged = average_earners(grid, target_t, a_prior, tau_prior,
-                                   p_inf, ceiling)
-        if averaged is not None:
-            e_mean, e_rel = averaged
-            resid = e_rel
-            median_ep = 100.0 * e_mean / players_target
-    if median_ep is None or median_ep <= 0:
-        median_ep = max(0.02, 100.0 * ceiling * 0.02)
-    if last_rate is not None and last_rate <= 0.0 and median_ep <= 0.0:
-        median_ep = 0.02
-
-    trend = trend_median(times, rates, target_t)
-    median_logit = logit_of(median_ep)
-    disagreement = 0.0
-    if trend is not None:
-        trend_rate, trend_resid = trend
-        median_logit = 0.80 * median_logit + 0.20 * logit_of(trend_rate)
-        disagreement = abs(logit_of(median_ep) - logit_of(trend_rate))
-        resid = max(resid, trend_resid * 0.5)
-    median = rate_from_logit(median_logit)
-
-    spread = 0.20 * math.sqrt(max(horizon_days, 0.01))
-    spread += spread_extra
-    spread += min(0.5 * resid, 0.25)
-    spread += min(0.30 * disagreement, 0.30)
-    if spread < 0.15:
-        spread = 0.15
-    if spread > 1.8:
-        spread = 1.8
-    # Backtests on synthetic finals put the best spread near half of the
-    # textbook width: the fitted curves already carry most of the
-    # information, so a wide band mostly pays for itself. Keep 0.7 of the
-    # computed width as insurance against the real data differing from
-    # the synthetic finals.
-    spread = spread * 0.7
-    if spread < 0.15:
-        spread = 0.15
-    return (median, spread)
+            break
+    stale_hours = hist.times[-1] - hist.times[run_start]
+    if stale_hours < 2.0:
+        return None
+    jumps = []
+    for j in range(1, n):
+        if hist.players[j - 1] > 0 and hist.players[j] > 1.05 * hist.players[j - 1]:
+            jumps.append(hist.players[j] / hist.players[j - 1])
+    if jumps:
+        jumps.sort()
+        dilution = jumps[len(jumps) // 2]
+    else:
+        dilution = LAUNCH_DILUTION
+    return stale_hours, dilution, hist.times[run_start]
 
 
-def forecast_case(case):
-    """Forecast every trophy of one case; returns the output rows."""
-    trophies = case.get("trophies") or []
-    horizon = case.get("horizon_minutes") or 0
-    horizon_days = horizon / 1440.0
-    try:
-        target_moment = parse_moment(case.get("target"))
-        target_t = hours_since_release(target_moment)
-    except (ValueError, TypeError):
-        target_t = 168.0
-    try:
-        checkpoint = parse_moment(case.get("at"))
-        checkpoint_t = hours_since_release(checkpoint)
-    except (ValueError, TypeError):
-        checkpoint_t = target_t
-
-    snapshots = distinct_snapshots(case)
-    stale = len(snapshots) <= 1
-    players_fit = None
-    if not stale:
-        players_fit = fit_players(snapshots, checkpoint_t)
-        if players_fit is not None:
-            target_u = target_t
-            base = snapshots[0][0]
-            u_target = max(target_u - base, 0.0)
-            p_inf = players_fit[1]
-            tau_p = players_fit[2]
-            p_target = p_inf * (1.0 - math.exp(-u_target / tau_p)) if u_target > 0 else p_inf
-            players_fit = (p_target, p_inf, tau_p, players_fit[3], players_fit[4])
-
+def forecast_case(case, name):
+    if case["levels"] != LEVELS:
+        raise ValueError(f"{name} asks for levels {case['levels']}, not {LEVELS}")
+    if not case["history"]:
+        raise ValueError(f"{name} has no history")
+    hist = History(case)
+    h_target = hours_since_release(parse_time(case["target"]))
+    horizon_hours = case["horizon_minutes"] / 60.0
+    p_target, _ = players_forecast(hist, h_target)
+    weights, resid_blend = backtest_weights(hist, case["trophies"], p_target)
+    # Earners-based variants compound two extrapolations (earners and
+    # players) while the rate-space variant extrapolates one quantity, so
+    # their edge fades with horizon. Penalise them mildly with horizon.
+    e_factor = 1.0 / math.sqrt(1.0 + horizon_hours / 24.0)
+    adj = dict(weights)
+    adj["recent"] *= e_factor
+    adj["weibull"] *= e_factor
+    wtot = sum(adj.values())
+    weights = {k: v / wtot for k, v in adj.items()}
+    # The rate-space variant estimates the ratio directly, so its two
+    # error sources cancel instead of compounding: it is structurally the
+    # most reliable at a long horizon, and the backtests -- which only
+    # reach 36h -- cannot be trusted to demote it below three quarters.
+    # The earners variants keep a quarter as a hedge for regimes where
+    # the ratio's trend breaks (saturation, refresh steps).
+    if weights["logtime"] < 0.75:
+        rest = 0.25
+        e_tot = weights["recent"] + weights["weibull"]
+        weights = {"logtime": 0.75,
+                   "recent": rest * weights["recent"] / e_tot if e_tot else 0.0,
+                   "weibull": rest * weights["weibull"] / e_tot if e_tot else 0.0}
+    stale = staleness(hist)
     rows = []
-    for index, trophy in enumerate(trophies):
-        trophy_id = trophy.get("id", index + 1)
-        try:
-            series = []
-            for t, players, rates in snapshots:
-                rate = rates[index] if index < len(rates) else None
-                series.append((t, rate, players))
-            last_rate = series[-1][1] if series else None
-            last_players = series[-1][2] if series else 1
-            if stale:
-                median = _stale_median(trophy, last_rate, last_players or 1)
-                spread = 0.30 * math.sqrt(max(horizon_days, 0.01)) + 0.70
-                spread += prior_for(trophy)[3]
-                if spread > 1.8:
-                    spread = 1.8
-                rows.append({"id": trophy_id,
-                             "q": _quantiles_from(median, spread)})
-            else:
-                median, spread = _forecast_one(
-                    trophy, series, target_t, horizon_days, players_fit)
-                rows.append({"id": trophy_id,
-                             "q": _quantiles_from(median, spread)})
-        except Exception:
-            fallback = 0.5
-            try:
-                fallback = series[-1][1]
-            except (NameError, IndexError, TypeError):
-                fallback = 0.5
-            if fallback is None:
-                fallback = 0.5
-            rows.append({"id": trophy_id,
-                         "q": _quantiles_from(fallback, 1.0)})
-    rows.sort(key=lambda row: row["id"])
-    return rows
+    for i, trophy in enumerate(case["trophies"]):
+        kind = archetype(trophy, hist.last_rates[i])
+        if kind == "universal":
+            rows.append({"id": trophy["id"], "q": [100, 100, 100, 100, 100]})
+            continue
+        ceiling = ceiling_for(case["trophies"], i, kind)
+        tau0, k0 = ARCH_WEIBULL[kind]
+        if kind == "story":
+            tau0 = 24.0 + 18.0 * story_depth(case["trophies"], i)
+        # On a long horizon this branch does not apply: 4.5 days of growth
+        # swamps one refresh, and the ensemble below is the right model.
+        if stale is not None and horizon_hours <= 12.0:
+            # The page is stale and the horizon is short: the answer is a
+            # refreshed page. Players jump by the dilution factor while
+            # earners grow by a factor between 1 and the dilution: the
+            # honest middle is the geometric mean, scaled down for deeper
+            # trophies that almost nobody can reach inside the window
+            # (a first-chapter trophy gains many new earners in a few
+            # hours; a final-mission trophy gains almost none).
+            stale_hours, dilution, run_start_h = stale
+            mid = math.sqrt(dilution)
+            if kind == "story":
+                decay = 0.6 ** story_depth(case["trophies"], i)
+            elif kind == "activity":
+                decay = 0.7
+            elif kind == "grind":
+                decay = 0.4
+            else:  # platinum
+                decay = 0.2
+            growth = 1.0 + (mid - 1.0) * decay
+            e_last = hist.earned[i][-1] or 0.0
+            p_refreshed = hist.last_players * dilution
+            median = 100.0 * e_last * growth / max(1.0, p_refreshed)
+            median = max(median, ARCH_FLOOR_PCT[kind])
+            sigma = math.sqrt(0.375 ** 2 + 0.45 ** 2)
+            q = [round4(clamp_pct(inv_logit_pct(logit_pct(median) + z * sigma)))
+                 for z in Z]
+            rows.append({"id": trophy["id"], "q": q})
+            continue
+        preds = {}
+        v2 = variant_logtime(hist, i, h_target)
+        if v2 is not None:
+            preds["logtime"] = v2
+        v3 = variant_recent_exp(hist, i, h_target, p_target, ceiling)
+        if v3 is not None:
+            preds["recent"] = v3
+        v1 = variant_weibull(hist, i, h_target, p_target, tau0, k0, ceiling)
+        if v1 is not None:
+            preds["weibull"] = v1
+        if preds:
+            wsum = sum(weights[k] for k in preds)
+            med_logit = sum(weights[k] * logit_pct(p) for k, p in preds.items()) / wsum
+            median = inv_logit_pct(med_logit)
+        else:
+            median = ARCH_FLOOR_PCT[kind]
+        median = max(median, ARCH_FLOOR_PCT[kind])
+        # Spread: the blended backtest residual (a ~27h-horizon error
+        # scale) grown to the real horizon, with the growth capped: a
+        # trend fit's error grows much slower than a random walk's, so an
+        # uncapped square-root growth would only widen the bands past
+        # honesty. Never below the backtest scale, never above a wide band.
+        # A flat tail on a long horizon adds refresh uncertainty on top.
+        base = resid_blend.get(kind, 0.30)
+        growth = min(math.sqrt(max(horizon_hours, 27.0) / 27.0), 1.8)
+        sigma = 1.25 * base * growth
+        if stale is not None:
+            sigma = math.sqrt(sigma ** 2 + 0.20 ** 2)
+        sigma = min(1.30, max(0.30, sigma))
+        q = [round4(clamp_pct(inv_logit_pct(logit_pct(median) + z * sigma)))
+             for z in Z]
+        rows.append({"id": trophy["id"], "q": q})
+    return {"trophies": rows}
 
 
 def main():
-    """Run every case in the input folder and write its forecast."""
-    in_dir = input_folder()
-    out_dir = output_folder()
-    for path in list_case_paths(in_dir):
-        try:
-            case = load_case(path)
-        except (OSError, ValueError):
-            continue
-        case_id = case.get("id")
-        if not case_id:
-            case_id = os.path.splitext(os.path.basename(path))[0]
-        try:
-            rows = forecast_case(case)
-        except Exception:
-            rows = []
-            for index, trophy in enumerate(case.get("trophies") or []):
-                rows.append({"id": trophy.get("id", index + 1),
-                             "q": [0.01, 0.05, 0.1, 0.5, 2.0]})
-        write_forecast(out_dir, case_id, rows)
-    return 0
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    for path in sorted(INPUT_DIR.glob("*.in")):
+        case = json.loads(path.read_text(encoding="utf-8"))
+        forecast = forecast_case(case, path.name)
+        (OUTPUT_DIR / f"{path.stem}.out").write_text(
+            json.dumps(forecast, separators=(",", ":")) + "\n", encoding="utf-8")
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
